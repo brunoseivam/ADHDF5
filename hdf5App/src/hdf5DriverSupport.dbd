@@ -1,0 +1,1 @@
+registrar("hdf5DriverRegister")

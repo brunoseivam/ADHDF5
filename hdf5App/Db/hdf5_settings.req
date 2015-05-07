@@ -1,0 +1,4 @@
+$(P)$(R)HDF5FilePath
+$(P)$(R)HDF5Loop
+$(P)$(R)HDF5AutoLoad
+file "ADBase_settings.req", P=$(P), R=$(R)

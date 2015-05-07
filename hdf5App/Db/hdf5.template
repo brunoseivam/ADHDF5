@@ -1,0 +1,96 @@
+# Database for the records specific to the HDF5 driver
+# Bruno Martins
+# May 5, 2015
+
+record(waveform, "$(P)$(R)HDF5FilePath") {
+    field(DESC, "HDF5 File Path")
+    field(DTYP, "asynOctetWrite")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_FILE_PATH")
+    field(FTVL, "CHAR")
+    field(NELM, "256")
+}
+
+record(bi,"$(P)$(R)HDF5FileExists_RBV") {
+    field(DESC, "File pointed by FilePath exists")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_FILE_EXISTS")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)HDF5DatasetsCount_RBV") {
+    field(DESC, "Number of datasets")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_DATASETS_COUNT")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)HDF5FirstFrame_RBV") {
+    field(DESC, "First frame of the dataset")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_FIRST_FRAME")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)HDF5LastFrame_RBV") {
+    field(DESC, "Last frame of the dataset")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_LAST_FRAME")
+    field(SCAN, "I/O Intr")
+}
+
+record(ai, "$(P)$(R)HDF5TotalFrames_RBV") {
+    field(DESC, "Number of images in HDF5 file")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_TOTAL_FRAMES")
+    field(PREC, "0")
+    field(SCAN, "I/O Intr")
+}
+
+record(ao, "$(P)$(R)HDF5CurrentFrame") {
+    field(DESC, "Number of the current frame being output")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_CURRENT_FRAME")
+}
+
+record(ai, "$(P)$(R)HDF5CurrentFrame_RBV") {
+    field(DESC, "Number of the current frame being output")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_CURRENT_FRAME")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo,"$(P)$(R)HDF5Loop") {
+    field(DESC, "Loop images in dataset")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_LOOP")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+}
+
+record(bi,"$(P)$(R)HDF5Loop_RBV") {
+    field(DESC, "Loop images in dataset")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_LOOP")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(SCAN, "I/O Intr")
+}
+
+record(bo,"$(P)$(R)HDF5AutoLoad") {
+    field(DESC, "Auto load first frame when file is opened")
+    field(DTYP, "asynInt32")
+    field(OUT,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_AUTO_LOAD")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+}
+
+record(bi,"$(P)$(R)HDF5AutoLoad_RBV") {
+    field(DESC, "Auto load first frame when file is opened")
+    field(DTYP, "asynInt32")
+    field(INP,  "@asyn($(PORT),$(ADDR),$(TIMEOUT))HDF5_AUTO_LOAD")
+    field(ZNAM, "No")
+    field(ONAM, "Yes")
+    field(SCAN, "I/O Intr")
+}

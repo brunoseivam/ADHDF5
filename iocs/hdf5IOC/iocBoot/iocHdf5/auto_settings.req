@@ -1,0 +1,4 @@
+file "hdf5_settings.req",         P=$(P),  R=cam1:
+file "NDStdArrays_settings.req",  P=$(P),  R=image1:
+file "NDPva_settings.req",        P=$(P),  R=pva1:
+#file "commonPlugin_settings.req", P=$(P)
