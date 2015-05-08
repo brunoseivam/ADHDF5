@@ -33,6 +33,22 @@
   #define MKDIR(a,b) mkdir(a,b)
 #endif
 
+#define FAIL_IF(cond,statement,msg)\
+    do{if(cond){\
+        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "%s:%s %s\n",\
+                driverName, functionName, msg);\
+        status = asynError;\
+        statement;\
+    }}while(0)
+
+#define FAIL_IF_ARGS(cond,statement,fmt,...)\
+    do{if(cond){\
+        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR, "%s:%s"fmt"\n",\
+                driverName, functionName, __VA_ARGS__);\
+        status = asynError;\
+        statement;\
+    }}while(0)
+
 #define HDF5FilePathString      "HDF5_FILE_PATH"
 #define HDF5FileExistsString    "HDF5_FILE_EXISTS"
 #define HDF5DatasetsCountString "HDF5_DATASETS_COUNT"
@@ -45,7 +61,7 @@
 
 static const char *driverName = "hdf5Driver";
 
-/** Driver for HDF5 files */
+// Driver for HDF5 files
 class hdf5Driver : public ADDriver
 {
 public:
@@ -534,6 +550,7 @@ asynStatus hdf5Driver::openFile (const char *path)
     H5G_info_t groupInfo;
     size_t totalFrames = 0;
     size_t maxWidth = 0, maxHeight = 0;
+    herr_t err;
 
     // Reset some parameters
     setIntegerParam(HDF5DatasetsCount,  0);
@@ -546,34 +563,16 @@ asynStatus hdf5Driver::openFile (const char *path)
     callParamCallbacks();
 
     // Get a file handle
-    if((fileId = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT)) < 0)
-    {
-        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                "%s:%s couldn't open file '%s'\n",
-                driverName, functionName, path);
-        status = asynError;
-        goto end;
-    }
+    fileId = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+    FAIL_IF_ARGS(fileId < 0, goto end, "couldn't open file '%s'", path);
 
     // Get a handle to the '/entry' group
-    if((groupId = H5Gopen2(fileId, "/entry", H5P_DEFAULT)) < 0)
-    {
-        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                "%s:%s couldn't open 'entry' group\n",
-                driverName, functionName);
-        status = asynError;
-        goto closeFile;
-    }
+    groupId = H5Gopen2(fileId, "/entry", H5P_DEFAULT);
+    FAIL_IF(groupId < 0, goto closeFile, "couldn't open 'entry' group");
 
     // Need groupInfo to obtain number of links
-    if(H5Gget_info(groupId, &groupInfo))
-    {
-        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                "%s:%s couldn't get group info\n",
-                driverName, functionName);
-        status = asynError;
-        goto closeGroup;
-    }
+    err = H5Gget_info(groupId, &groupInfo);
+    FAIL_IF(err, goto closeGroup, "couldn't get group info");
 
     // Deallocate information of previous file
     if(mpDatasets)
@@ -583,6 +582,7 @@ asynStatus hdf5Driver::openFile (const char *path)
         free(mpDatasets);
     }
 
+    // TODO: realloc?
     // Allocate memory to store dataset information
     mpDatasets = (struct dsetInfo*) calloc(groupInfo.nlinks,
             sizeof(*mpDatasets));
@@ -625,13 +625,8 @@ asynStatus hdf5Driver::openFile (const char *path)
             maxWidth = dims[2];
 
         // Read type
-        if(parseType(pDSet->id, &pDSet->type))
-        {
-            asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                    "%s:%s couldn't parse dataset type\n",
-                    driverName, functionName);
-            status = asynError;
-        }
+        status = parseType(pDSet->id, &pDSet->type);
+        FAIL_IF(status, continue, "couldn't parse dataset type");
     }
 
     // Update parameters
@@ -704,6 +699,7 @@ asynStatus hdf5Driver::getFrameData (int frame, void *pData)
 
     struct dsetInfo *pDSet;
     hid_t dSpace, dType, mSpace;
+    herr_t err;
 
     pDSet = getDatasetByFrame(frame);
     if(!pDSet)
@@ -712,41 +708,28 @@ asynStatus hdf5Driver::getFrameData (int frame, void *pData)
     hsize_t offset[3] = {(hsize_t)(frame - pDSet->imageNrLow), 0, 0};
     hsize_t count[3]  = {1, pDSet->height, pDSet->width};
 
-    if((dSpace = H5Dget_space(pDSet->id)) < 0)
-    {
-        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                "%s:%s couldn't get dataspace\n",
-                driverName, functionName);
-        return asynError;
-    }
+    dSpace = H5Dget_space(pDSet->id);
+    FAIL_IF(dSpace < 0, goto end, "couldn't get dataspace");
 
-    dType = H5Dget_type(pDSet->id);
+    dType  = H5Dget_type(pDSet->id);
+    FAIL_IF(dType < 0, goto end, "couldn't get dataset type");
 
     mSpace = H5Screate_simple(3, count, NULL);
+    FAIL_IF(mSpace < 0, goto closeType, "couldn't create dataset");
 
     // Select the hyperslab
-    if(H5Sselect_hyperslab(dSpace, H5S_SELECT_SET, offset, NULL, count,
-            NULL) < 0)
-    {
-        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                "%s:%s couldn't select hyperslab\n",
-                driverName, functionName);
-        status = asynError;
-        goto end;
-    }
+    err = H5Sselect_hyperslab(dSpace, H5S_SELECT_SET, offset, NULL, count, NULL);
+    FAIL_IF(err, goto closeSpace, "couldn't select hyperslab");
 
-    // and finally read the image
-    if(H5Dread(pDSet->id, dType, mSpace, dSpace, H5P_DEFAULT, pData) < 0)
-    {
-        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                "%s:%s couldn't read image\n",
-                driverName, functionName);
-        status = asynError;
-    }
+    // And finally read the image
+    err = H5Dread(pDSet->id, dType, mSpace, dSpace, H5P_DEFAULT, pData);
+    FAIL_IF(err, goto closeSpace, "couldn't read image");
 
-end:
-    H5Tclose(dType);
+closeSpace:
     H5Sclose(mSpace);
+closeType:
+    H5Tclose(dType);
+end:
     return status;
 }
 
@@ -772,12 +755,8 @@ asynStatus hdf5Driver::parseType (hid_t id, NDDataType_t *pNDType)
                 case 2: *pNDType = NDUInt16; break;
                 case 4: *pNDType = NDUInt32; break;
                 default:
-                    asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                            "%s:%s invalid dataset type: "
-                            "unsigned integer with %lu bytes\n",
-                            driverName, functionName, dsetTypeSize);
-                    status = asynError;
-                    break;
+                    FAIL_IF_ARGS(1, goto end, "unsigned int (%lu bytes)",
+                            dsetTypeSize);
             }
         }
         else if(dsetTypeSign == H5T_SGN_2)
@@ -788,20 +767,13 @@ asynStatus hdf5Driver::parseType (hid_t id, NDDataType_t *pNDType)
                 case 2: *pNDType = NDInt16; break;
                 case 4: *pNDType = NDInt32; break;
                 default:
-                    asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                            "%s:%s invalid dataset type: "
-                            "signed integer with %lu bytes\n",
-                            driverName, functionName, dsetTypeSize);
-                    status = asynError;
-                    break;
+                    FAIL_IF_ARGS(1, goto end, "signed int (%lu bytes)",
+                            dsetTypeSize);
             }
         }
         else
         {
-            asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                    "%s:%s invalid dataset type sign\n",
-                    driverName, functionName);
-            status = asynError;
+            FAIL_IF(1, goto end, "invalid dataset type sign");
         }
     }
     else if(dsetTypeClass == H5T_FLOAT)
@@ -811,22 +783,16 @@ asynStatus hdf5Driver::parseType (hid_t id, NDDataType_t *pNDType)
             case 4: *pNDType = NDFloat32; break;
             case 8: *pNDType = NDFloat64; break;
             default:
-                asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                        "%s:%s invalid dataset type: "
-                        "float with %lu bytes\n",
-                        driverName, functionName, dsetTypeSize);
-                status = asynError;
-                break;
+                FAIL_IF_ARGS(1, goto end, "invalid float (%lu bytes)",
+                        dsetTypeSize);
         }
     }
     else
     {
-        asynPrint(pasynUserSelf, ASYN_TRACE_ERROR,
-                "%s:%s dataset type class not accepted",
-                driverName, functionName);
-        status = asynError;
+        FAIL_IF(1, goto end, "dataset type class not accepted");
     }
 
+end:
     H5Tclose(type);
     return status;
 }
