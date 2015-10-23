@@ -12,25 +12,27 @@
 #include <epicsThread.h>
 #include <iocsh.h>
 #include <asynOctetSyncIO.h>
-#include <math.h>
+#include <algorithm>
+#include <epicsString.h>
 
-#include <vector>
 #include <hdf5.h>
 #include <hdf5_hl.h>
-#include <iostream>
 
 #include "ADDriver.h"
 
 #if defined(_WIN32)              // Windows
   #include <direct.h>
   #define MKDIR(a,b) _mkdir(a)
+  #define DELIM '\\'
 #elif defined(vxWorks)           // VxWorks
   #include <sys/stat.h>
   #define MKDIR(a,b) mkdir(a)
+  #define DELIM '/'
 #else                            // Linux
   #include <sys/stat.h>
   #include <sys/types.h>
   #define MKDIR(a,b) mkdir(a,b)
+  #define DELIM '/'
 #endif
 
 #define FAIL_IF(cond,statement,msg)\
@@ -58,6 +60,7 @@
 #define HDF5CurrentFrameString  "HDF5_CURRENT_FRAME"
 #define HDF5AutoLoadFrameString "HDF5_AUTO_LOAD"
 #define HDF5LoopString          "HDF5_LOOP"
+#define HDF5InMemoryString      "HDF5_IN_MEMORY"
 
 static const char *driverName = "hdf5Driver";
 
@@ -88,25 +91,32 @@ protected:
     int HDF5CurrentFrame;
     int HDF5AutoLoadFrame;
     int HDF5Loop;
-    #define LAST_HDF5_PARAM HDF5Loop
+    int HDF5InMemory;
+    #define LAST_HDF5_PARAM HDF5InMemory
 
 private:
-    epicsEventId mStartEventId;
-    epicsEventId mStopEventId;
-    size_t mDatasetsCount;
-    struct dsetInfo
+    typedef struct dSetInfo
     {
         hid_t id;
         int imageNrLow;
         int imageNrHigh;
-        size_t width, height;
+        size_t width, height, nFrames;
         NDDataType_t type;
-    }*mpDatasets;
+    }dSetInfo_t;
+
+    epicsEventId mStartEventId;
+    epicsEventId mStopEventId;
+    size_t       mDatasetsCount;
+    dSetInfo_t   *mpDatasets;
 
     /* These are the methods that are new to this class */
     bool checkFilePath      (const char *path);
-    asynStatus openFile     (const char *path);
-    struct dsetInfo *getDatasetByFrame (int frame);
+    char *getFolder         (const char *path, size_t *folderLen);
+    asynStatus loadFile     (const char *path);
+    asynStatus openFile     (const char *path, hid_t *fId);
+    asynStatus openDataset  (hid_t gId, dSetInfo_t *dInfo, const char *dName,
+            const char *folder);
+    struct dSetInfo *getDatasetByFrame (int frame);
     asynStatus getFrameInfo (int frame, size_t *pDims, NDDataType_t *pType);
     asynStatus getFrameData (int frame, void *pData);
     asynStatus parseType    (hid_t id, NDDataType_t *pNDType);
@@ -176,6 +186,7 @@ hdf5Driver::hdf5Driver (const char *portName, int maxBuffers, size_t maxMemory,
     createParam(HDF5CurrentFrameString,   asynParamInt32, &HDF5CurrentFrame);
     createParam(HDF5AutoLoadFrameString,  asynParamInt32, &HDF5AutoLoadFrame);
     createParam(HDF5LoopString,           asynParamInt32, &HDF5Loop);
+    createParam(HDF5InMemoryString,       asynParamInt32, &HDF5InMemory);
 
     status = asynSuccess;
 
@@ -187,6 +198,7 @@ hdf5Driver::hdf5Driver (const char *portName, int maxBuffers, size_t maxMemory,
     status |= setIntegerParam(HDF5CurrentFrame,     0);
     status |= setIntegerParam(HDF5AutoLoadFrame,    0);
     status |= setIntegerParam(HDF5Loop,             0);
+    status |= setIntegerParam(HDF5InMemory,         0);
     status |= setDoubleParam (ADAcquirePeriod,      0.02);
 
     callParamCallbacks();
@@ -316,9 +328,13 @@ asynStatus hdf5Driver::writeOctet (asynUser *pasynUser, const char *value,
             int acquiring;
             getIntegerParam(ADStatus, &acquiring);
             if(acquiring != ADStatusAcquire)
+                status = loadFile(value);
+            else
             {
-                openFile(value);
-
+                asynPrint(pasynUser, ASYN_TRACE_ERROR,
+                        "%s:%s: can't change file path while acquiring",
+                        driverName, functionName);
+                status = asynError;
             }
         }
     }
@@ -541,7 +557,147 @@ bool hdf5Driver::checkFilePath (const char *path)
     return !stat(path, &buff) && (S_IFREG & buff.st_mode);
 }
 
-asynStatus hdf5Driver::openFile (const char *path)
+char *hdf5Driver::getFolder (const char *path, size_t *folderLen)
+{
+    char *folder = epicsStrDup(path);
+    char *delim = strrchr(folder, DELIM);
+
+    if(!delim)
+        folder[0] = '\0';
+    else
+        *(delim + 1) = '\0';
+
+    if(folderLen)
+        *folderLen = strlen(folder);
+
+    return folder;
+}
+
+asynStatus hdf5Driver::openFile (const char *path, hid_t *fId)
+{
+    asynStatus status = asynSuccess;
+    const char *functionName = "openFile";
+    FILE *fHandle;
+    size_t size, left;
+    char *buf;
+    int inMemory;
+
+    getIntegerParam(HDF5InMemory, &inMemory);
+
+    // Simple case: let the HDF5 library open the file
+    if(!inMemory)
+    {
+        *fId = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
+        FAIL_IF_ARGS(*fId < 0, , "unable to open file %s", path);
+        goto end;
+    }
+
+    // Portably open file
+    fHandle = fopen(path, "rb");
+    FAIL_IF_ARGS(!fHandle, goto end, "unable to open file %s", path);
+
+    // Get file size
+    fseek(fHandle, 0, SEEK_END);
+    size = ftell(fHandle);
+    rewind(fHandle);
+
+    // Allocate memory to hold file contents
+    buf = (char*) malloc(size);
+    FAIL_IF_ARGS(!buf, goto closeFile, "unable to allocate %lu bytes", size);
+
+    // Read file contents into buffer
+    left = size;
+    while(left)
+    {
+        size_t r = fread(buf, 1, left, fHandle);
+        FAIL_IF_ARGS(!r, goto freeMem, "couldn't read %lu bytes from file",
+                left);
+        left -= r;
+    }
+
+    // Give buffer to HDF5 library. It will free the buffer when it's done
+    *fId = H5LTopen_file_image(buf, size, H5LT_FILE_IMAGE_DONT_COPY);
+    FAIL_IF(*fId < 0, , "couldn't open file image");
+
+freeMem:
+    if(status)
+        free(buf);
+closeFile:
+    fclose(fHandle);
+end:
+    return status;
+}
+
+asynStatus hdf5Driver::openDataset (hid_t gId, dSetInfo_t *dInfo,
+        const char *dName, const char *folder)
+{
+    asynStatus status = asynSuccess;
+    const char *functionName = "openDataset";
+    int inMemory;
+    herr_t err;
+    H5L_info_t info;
+    hsize_t dims[3] = {0,0,0};
+
+    getIntegerParam(HDF5InMemory, &inMemory);
+
+    err = H5Lget_info(gId, dName, &info, H5P_DEFAULT);
+    FAIL_IF_ARGS(err < 0, goto end, "couldn't get info about %s", dName);
+
+    if(!inMemory || info.type != H5L_TYPE_EXTERNAL)
+    {
+        dInfo->id = H5Dopen2(gId, dName, H5P_DEFAULT);
+        FAIL_IF_ARGS(dInfo->id < 0, goto end, "couldn't open dataset %s",dName);
+    }
+    else
+    {
+        char buf[info.u.val_size];
+        const char *filename, *objpath;
+
+        H5Lget_val(gId, dName, buf, info.u.val_size, H5P_DEFAULT);
+        H5Lunpack_elink_val(buf, info.u.val_size, NULL, &filename, &objpath);
+
+        char dSetFilePath[strlen(folder) + strlen(filename) + 1];
+        strcpy(dSetFilePath, folder);
+        strcat(dSetFilePath, filename);
+
+        hid_t fileId;
+        status = openFile(dSetFilePath, &fileId);
+        FAIL_IF_ARGS(status, goto end, "couldn't open file %s", dSetFilePath);
+
+        dInfo->id = H5Dopen2(fileId, objpath, H5P_DEFAULT);
+        H5Fclose(fileId);
+        FAIL_IF_ARGS(dInfo->id < 0, goto end, "couldn't open dataset %s",dName);
+    }
+
+    // Read dataset attributes
+    err = H5LTget_attribute_int(dInfo->id, ".", "image_nr_low",
+            &dInfo->imageNrLow);
+    FAIL_IF(err, goto closeDataset, "couldn't read attribute image_nr_low");
+
+    err = H5LTget_attribute_int(dInfo->id, ".", "image_nr_high",
+            &dInfo->imageNrHigh);
+    FAIL_IF(err, goto closeDataset, "couldn't read attribute image_nr_high");
+
+    // Read dimensions (assume a 3D dataset)
+    err = H5LTget_dataset_info(dInfo->id, ".", dims, NULL, NULL);
+    FAIL_IF(err, goto closeDataset, "couldn't read dataset info");
+
+    dInfo->nFrames = dims[0];
+    dInfo->height  = dims[1];
+    dInfo->width   = dims[2];
+
+    // Read type
+    status = parseType(dInfo->id, &dInfo->type);
+    FAIL_IF(status, , "couldn't parse dataset type");
+
+closeDataset:
+    if(status)
+        H5Dclose(dInfo->id);
+end:
+    return status;
+}
+
+asynStatus hdf5Driver::loadFile (const char *path)
 {
     asynStatus status = asynSuccess;
     const char *functionName = "loadFile";
@@ -551,6 +707,11 @@ asynStatus hdf5Driver::openFile (const char *path)
     size_t totalFrames = 0;
     size_t maxWidth = 0, maxHeight = 0;
     herr_t err;
+    char *folder = getFolder(path, NULL);
+
+    // Open file
+    status = openFile(path, &fileId);
+    FAIL_IF_ARGS(status, goto end, "couldn't open file %s", path);
 
     // Reset some parameters
     setIntegerParam(HDF5DatasetsCount,  0);
@@ -562,10 +723,6 @@ asynStatus hdf5Driver::openFile (const char *path)
     setIntegerParam(ADMaxSizeY,         0);
     callParamCallbacks();
 
-    // Get a file handle
-    fileId = H5Fopen(path, H5F_ACC_RDONLY, H5P_DEFAULT);
-    FAIL_IF_ARGS(fileId < 0, goto end, "couldn't open file '%s'", path);
-
     // Get a handle to the '/entry' group
     groupId = H5Gopen2(fileId, "/entry", H5P_DEFAULT);
     FAIL_IF(groupId < 0, goto closeFile, "couldn't open 'entry' group");
@@ -574,59 +731,45 @@ asynStatus hdf5Driver::openFile (const char *path)
     err = H5Gget_info(groupId, &groupInfo);
     FAIL_IF(err, goto closeGroup, "couldn't get group info");
 
-    // Deallocate information of previous file
-    if(mpDatasets)
-    {
-        for(size_t i = 0; i < mDatasetsCount; ++i)
-            H5Dclose(mpDatasets[i].id);
-        free(mpDatasets);
-    }
+    // Deallocate information from previous file
+    for(size_t i = 0; i < mDatasetsCount; ++i)
+        H5Dclose(mpDatasets[i].id);
 
-    // TODO: realloc?
     // Allocate memory to store dataset information
-    mpDatasets = (struct dsetInfo*) calloc(groupInfo.nlinks,
-            sizeof(*mpDatasets));
+    mpDatasets = (struct dSetInfo*) realloc(mpDatasets,
+            groupInfo.nlinks*sizeof(*mpDatasets));
     mDatasetsCount = 0;
 
     // Iterate over '/entry' objects
     for(size_t i = 0; i < groupInfo.nlinks; ++i)
     {
-        // Get object name
-        char dsetName[256];
+        // Get object name (only interested in the first four characters)
+        ssize_t dSetNameLen = H5Lget_name_by_idx(groupId, ".", H5_INDEX_NAME,
+                H5_ITER_INC, i, NULL, 0, H5P_DEFAULT) + 1;
+
+        char dSetName[dSetNameLen];
         H5Lget_name_by_idx(groupId, ".", H5_INDEX_NAME, H5_ITER_INC, i,
-                dsetName, sizeof(dsetName), H5P_DEFAULT);
+                dSetName, dSetNameLen, H5P_DEFAULT);
 
         // If it doesn't start with 'data' it isn't a dataset. Ignore it.
-        if(strncmp(dsetName, "data", 4))
+        if(strncmp(dSetName, "data", 4))
             continue;
 
         // Get a handle to the dataset info structure
-        struct dsetInfo *pDSet = &mpDatasets[mDatasetsCount++];
-        pDSet->id = H5Dopen2(groupId, dsetName, H5P_DEFAULT);
+        struct dSetInfo *pDSet = &mpDatasets[mDatasetsCount++];
 
-        // Read dataset attributes
-        H5LTget_attribute_int(pDSet->id, ".", "image_nr_low",
-                &pDSet->imageNrLow);
-        H5LTget_attribute_int(pDSet->id, ".", "image_nr_high",
-                &pDSet->imageNrHigh);
+        // Open dataset
+        if(openDataset(groupId, pDSet, dSetName, folder))
+        {
+            // Close previously opened datasets
+            for(size_t j = 0; j < mDatasetsCount-1; ++j)
+                H5Dclose(pDSet->id);
+            mDatasetsCount = 0;
+        }
 
-        // Read dimensions (assume a 3D dataset)
-        hsize_t dims[3] = {0,0,0};
-        H5LTget_dataset_info(pDSet->id, ".", dims, NULL, NULL);
-        totalFrames  += dims[0];
-        pDSet->height = dims[1];
-        pDSet->width  = dims[2];
-
-        // Calculate maxHeight and maxWidth
-        if(dims[1] > maxHeight)
-            maxHeight = dims[1];
-
-        if(dims[2] > maxWidth)
-            maxWidth = dims[2];
-
-        // Read type
-        status = parseType(pDSet->id, &pDSet->type);
-        FAIL_IF(status, continue, "couldn't parse dataset type");
+        totalFrames += pDSet->nFrames;
+        maxWidth     = std::max(maxWidth,  pDSet->width);
+        maxHeight    = std::max(maxHeight, pDSet->height);
     }
 
     // Update parameters
@@ -661,14 +804,15 @@ closeGroup:
 closeFile:
     H5Fclose(fileId);
 end:
+    free(folder);
     return status;
 }
 
-struct hdf5Driver::dsetInfo *hdf5Driver::getDatasetByFrame (int frame)
+struct hdf5Driver::dSetInfo *hdf5Driver::getDatasetByFrame (int frame)
 {
     for(size_t i = 0; i < mDatasetsCount; ++i)
     {
-        struct dsetInfo *pDSet = &mpDatasets[i];
+        struct dSetInfo *pDSet = &mpDatasets[i];
         if(frame >= pDSet->imageNrLow && frame <= pDSet->imageNrHigh)
             return pDSet;
     }
@@ -682,7 +826,7 @@ struct hdf5Driver::dsetInfo *hdf5Driver::getDatasetByFrame (int frame)
 asynStatus hdf5Driver::getFrameInfo (int frame, size_t *pDims,
         NDDataType_t *pType)
 {
-    struct dsetInfo *pDSet = getDatasetByFrame(frame);
+    struct dSetInfo *pDSet = getDatasetByFrame(frame);
     if(!pDSet)
         return asynError;
 
@@ -697,7 +841,7 @@ asynStatus hdf5Driver::getFrameData (int frame, void *pData)
     const char *functionName = "getFrameData";
     asynStatus status = asynSuccess;
 
-    struct dsetInfo *pDSet;
+    struct dSetInfo *pDSet;
     hid_t dSpace, dType, mSpace;
     herr_t err;
 
@@ -743,8 +887,6 @@ asynStatus hdf5Driver::parseType (hid_t id, NDDataType_t *pNDType)
     H5T_sign_t dsetTypeSign = H5Tget_sign(type);
     size_t dsetTypeSize = H5Tget_size(type);
 
-    *pNDType = NDInt8;   // Default to signed char
-
     if(dsetTypeClass == H5T_INTEGER)
     {
         if(dsetTypeSign == H5T_SGN_NONE)
@@ -755,7 +897,7 @@ asynStatus hdf5Driver::parseType (hid_t id, NDDataType_t *pNDType)
                 case 2: *pNDType = NDUInt16; break;
                 case 4: *pNDType = NDUInt32; break;
                 default:
-                    FAIL_IF_ARGS(1, goto end, "unsigned int (%lu bytes)",
+                    FAIL_IF_ARGS(true, goto end, "unsigned int (%lu bytes)",
                             dsetTypeSize);
             }
         }
@@ -767,14 +909,12 @@ asynStatus hdf5Driver::parseType (hid_t id, NDDataType_t *pNDType)
                 case 2: *pNDType = NDInt16; break;
                 case 4: *pNDType = NDInt32; break;
                 default:
-                    FAIL_IF_ARGS(1, goto end, "signed int (%lu bytes)",
+                    FAIL_IF_ARGS(true, goto end, "signed int (%lu bytes)",
                             dsetTypeSize);
             }
         }
         else
-        {
-            FAIL_IF(1, goto end, "invalid dataset type sign");
-        }
+            FAIL_IF(true, goto end, "invalid dataset type sign");
     }
     else if(dsetTypeClass == H5T_FLOAT)
     {
@@ -783,13 +923,13 @@ asynStatus hdf5Driver::parseType (hid_t id, NDDataType_t *pNDType)
             case 4: *pNDType = NDFloat32; break;
             case 8: *pNDType = NDFloat64; break;
             default:
-                FAIL_IF_ARGS(1, goto end, "invalid float (%lu bytes)",
+                FAIL_IF_ARGS(true, goto end, "invalid float (%lu bytes)",
                         dsetTypeSize);
         }
     }
     else
     {
-        FAIL_IF(1, goto end, "dataset type class not accepted");
+        FAIL_IF(true, goto end, "dataset type class not accepted");
     }
 
 end:
